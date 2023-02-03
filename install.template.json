@@ -1,0 +1,335 @@
+{
+  "requirements": {
+    "cloud_provider": "aws",
+    "image": "atomized-alpine",
+    "vcs": ["github"],
+    "prerequisites": [
+      {
+        "conditions": [
+          "<<cloud.resources.vpcs>> not empty",
+          "<<cloud.resources.subnets[1]>> not empty"
+        ],
+        "message": "This service requires a VPC and at least 2 subnets in your AWS account",
+        "link": {
+          "message": "Create VPC",
+          "template": "atomizedhq/deploy-template-aws-vpc"
+        }
+      }
+    ]
+  },
+  "build": [
+    {
+      "name": "Initializing Infrastructure",
+      "action": "infrastructure.init"
+    },
+    {
+      "name": "Building Scripts",
+      "action": "cmd.run",
+      "content": "echo 'FROM <<base_images>>/falconheavy-base-images/atomized-python37\nWORKDIR /logn_mysql\nCOPY ./install_logn_mysql .\nENTRYPOINT /logn_mysql/install_logn_mysql' > Dockerfile\necho '#!/bin/bash\nset -e\nssh-keygen -t rsa -N \"\" -f my_rsa_key <<< y\naws ec2-instance-connect send-ssh-public-key --instance-id <<project.metadata.instance_id>> --availability-zone <<project.metadata.instance_az>> --instance-os-user <<project.metadata.runtime_user>> --ssh-public-key file://my_rsa_key.pub\nssh -o StrictHostKeyChecking=no -i my_rsa_key <<project.metadata.runtime_user>>@<<project.metadata.instance_priv_dns>> \"bash -s\" <<ENDSSH\nsudo apt-get update\nsudo apt-get -y upgrade\nsudo apt-get install -y libssl-dev libncurses-dev perl cmake make build-essential g++ bison pkg-config\nmkdir ~/logn_mysql\ncd ~/logn_mysql\ngit init\ngit remote add origin https://x-access-token:<<vcs.token>>@github.com/<<vcs.owner>>/<<vcs.repo>>.git\ngit fetch origin <<vcs.hash>>\ngit reset --hard FETCH_HEAD\nmkdir build\ncd build\nsudo cmake ../ -DDOWNLOAD_BOOST=1 -DWITH_BOOST=/boost_1_73_0\nsudo make -j<<project.metadata.cores>>\nsudo service mysql stop\nbin/mysqld --initialize\nbin/mysqld &\nENDSSH' > install_logn_mysql\nchmod 755 install_logn_mysql"
+    },
+    {
+      "name": "Build Docker Image",
+      "action": "cmd.run",
+      "content": "docker build -t << cloud.external_id >>.dkr.ecr.<<cloud.region>>.amazonaws.com/<<project.alias>>-<<project.id>>:<<build.id.replace(-,)>> -f ./Dockerfile  << project.metadata.build_args >> ."
+    },
+    {
+      "name": "Planning Infrastructure",
+      "action": "infrastructure.plan"
+    },
+    {
+      "name": "Applying Infrastructure",
+      "action": "infrastructure.apply"
+    },
+    {
+      "name": "Push Docker Image to ECR",
+      "action": "cmd.run",
+      "content": "aws ecr get-login-password --region <<cloud.region>> | docker login --username AWS --password-stdin << cloud.external_id >>.dkr.ecr.<<cloud.region>>.amazonaws.com\ndocker push << cloud.external_id >>.dkr.ecr.<<cloud.region>>.amazonaws.com/<<project.alias>>-<<project.id>>:<<build.id.replace(-,)>>"
+    },
+    {
+      "name": "Run Installation Task",
+      "action": "cmd.run",
+      "content": "aws ecs run-task --cluster <<project.alias>>-<<project.id>> --task-definition <<project.metadata.task_definition_arn>> --launch-type FARGATE --network-configuration awsvpcConfiguration={subnets=[<<project.metadata.app_subnets>>],securityGroups=[<<project.metadata.container_security_group>>],assignPublicIp=DISABLED} --tags key=logn_mysql,value=true --output text"
+    }
+  ],
+  "terraform": {
+    "locals": {
+      "security_group": "${length(data.aws_instance.instance.vpc_security_group_ids) > 0 ? sort(data.aws_instance.instance.vpc_security_group_ids)[0] : length(data.aws_instance.instance.security_groups) > 0 ? sort(data.aws_instance.instance.security_groups)[0] : null}",
+      "name": "<<project.alias>>-<<project.id>>",
+      "project_id": "<<project.id>>"
+    },
+    "data": {
+      "aws_caller_identity": {
+        "current": {}
+      },
+      "aws_region": {
+        "current": {}
+      },
+      "aws_instance": {
+        "instance": {
+          "instance_id": "${var.instance_id}"
+        }
+      }
+    },
+    "output": {
+      "ecr_repo_url": {
+        "value": "${aws_ecr_repository.ecr_repository.repository_url}"
+      },
+      "task_definition_arn": {
+        "value": "${aws_ecs_task_definition.ecs_task_definition.arn}"
+      },
+      "container_security_group": {
+        "value": "${aws_security_group.container_security_group.id}"
+      },
+      "instance_az": {
+        "value": "${data.aws_instance.instance.availability_zone}"
+      },
+      "instance_priv_dns": {
+        "value": "${data.aws_instance.instance.private_dns}"
+      }
+    },
+    "resource": {
+      "aws_cloudwatch_log_group": {
+        "cloudwatch_log_group": {
+          "name": "/ecs/${local.name}",
+          "retention_in_days": 30,
+          "tags": {
+            "atomized": "true"
+          }
+        }
+      },
+      "aws_ecr_repository": {
+        "ecr_repository": {
+          "image_scanning_configuration": {
+            "scan_on_push": true
+          },
+          "name": "${local.name}",
+          "tags": {
+            "atomized": "true"
+          }
+        }
+      },
+      "aws_ecs_cluster": {
+        "ecs_cluster": {
+          "name": "${local.name}",
+          "tags": {
+            "atomized": "true"
+          }
+        }
+      },
+      "aws_ecs_task_definition": {
+        "ecs_task_definition": {
+          "container_definitions": "[{\"name\":\"${local.name}\",\"image\":\"${aws_ecr_repository.ecr_repository.repository_url}:${var.repository_tag}\",\"cpu\":256,\"memory\":512,\"essential\":true,\"logConfiguration\":{\"logDriver\":\"awslogs\",\"options\":{\"awslogs-group\":\"/ecs/${local.name}\",\"awslogs-region\":\"<<cloud.region>>\",\"awslogs-stream-prefix\":\"ecs\"}},\"executionRoleArn\":\"${aws_iam_role.container_iam_role.arn}\",\"taskRoleArn\":\"${aws_iam_role.container_iam_role.arn}\"}]",
+          "cpu": "256",
+          "execution_role_arn": "${aws_iam_role.container_iam_role.arn}",
+          "family": "${trim(substr(local.name,0,31), \"-\")}",
+          "memory": "512",
+          "network_mode": "awsvpc",
+          "requires_compatibilities": ["FARGATE"],
+          "tags": {
+            "atomized": "true"
+          },
+          "task_role_arn": "${aws_iam_role.container_iam_role.arn}"
+        }
+      },
+      "aws_iam_role": {
+        "container_iam_role": {
+          "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Action\":[\"sts:AssumeRole\"],\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"ecs-tasks.amazonaws.com\"]}}]}",
+          "name": "${trim(substr(local.name,0,63), \"-\")}",
+          "tags": {
+            "atomized": "true"
+          }
+        }
+      },
+      "aws_iam_role_policy": {
+        "container_iam_policy": {
+          "depends_on": ["aws_iam_role.container_iam_role"],
+          "name": "ecs_permissions",
+          "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"allowDecrypt\",\"Action\":[\"kms:Decrypt\"],\"Resource\":[\"*\"],\"Effect\":\"Allow\"},{\"Sid\":\"getSecrets\",\"Action\":[\"ssm:GetParametersByPath\",\"ssm:GetParameters\",\"ssm:GetParameter\",\"ssm:DescribeParameters\"],\"Resource\":[\"arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/*\"],\"Effect\":\"Allow\"},{\"Sid\":\"allowImagePull\",\"Action\":[\"ecr:GetAuthorizationToken\"],\"Resource\":[\"*\"],\"Effect\":\"Allow\"},{\"Sid\":\"runContainer\",\"Action\":[\"ecr:BatchCheckLayerAvailability\",\"ecr:BatchGetImage\",\"ecr:GetDownloadUrlForLayer\"],\"Resource\":[\"${aws_ecr_repository.ecr_repository.arn}\"],\"Effect\":\"Allow\"},{\"Sid\":\"writeLogs\",\"Action\":[\"logs:CreateLogStream\",\"logs:PutLogEvents\",\"logs:DescribeLogStreams\"],\"Resource\":[\"*\"],\"Effect\":\"Allow\"},{\"Action\":[\"ec2-instance-connect:SendSSHPublicKey\"],\"Effect\":\"Allow\",\"Resource\":[\"${data.aws_instance.instance.arn}\"]}]}",
+          "role": "${aws_iam_role.container_iam_role.name}"
+        }
+      },
+      "aws_security_group": {
+        "container_security_group": {
+          "description": "allows the container to receive traffic",
+          "egress": [
+            {
+              "cidr_blocks": ["0.0.0.0/0"],
+              "description": "Allowoutbound",
+              "from_port": 0,
+              "ipv6_cidr_blocks": null,
+              "prefix_list_ids": null,
+              "protocol": "-1",
+              "security_groups": null,
+              "self": null,
+              "to_port": 0
+            }
+          ],
+          "ingress": [
+            {
+              "cidr_blocks": null,
+              "description": "Allowself",
+              "from_port": 0,
+              "ipv6_cidr_blocks": null,
+              "prefix_list_ids": null,
+              "protocol": "-1",
+              "security_groups": null,
+              "self": true,
+              "to_port": 0
+            }
+          ],
+          "name": "container-${local.name}",
+          "revoke_rules_on_delete": true,
+          "tags": {
+            "atomized": "true",
+            "project_id": "${local.project_id}"
+          },
+          "vpc_id": "${var.network}"
+        }
+      },
+      "aws_security_group_rule": {
+        "atomized_remote_access": {
+          "type": "ingress",
+          "from_port": 22,
+          "to_port": 22,
+          "protocol": "tcp",
+          "security_group_id": "${local.security_group}",
+          "source_security_group_id": "${aws_security_group.container_security_group.id}"
+        }
+      }
+    },
+    "variable": {
+      "instance_id": {
+        "default": "<<project.metadata.instance_id>>",
+        "type": "string"
+      },
+      "network": {
+        "default": "<<project.metadata.network>>",
+        "type": "string"
+      },
+      "app_subnets": {
+        "default": "<<project.metadata.app_subnets>>",
+        "type": "string"
+      },
+      "repository_tag": {
+        "default": "<<build.id.replace(-,)>>",
+        "type": "string"
+      }
+    }
+  },
+  "fields": [
+    {
+      "sections": [
+        {
+          "fields": [
+            {
+              "label": "Service VPC",
+              "name": "network",
+              "optionsFrom": {
+                "titleKey": "name",
+                "valueKey": "vpc_id",
+                "values": "<<cloud.resources.vpcs>>"
+              },
+              "onChange": [
+                {
+                  "values": [
+                    {
+                      "key": "app_subnets",
+                      "value": null
+                    }
+                  ]
+                }
+              ],
+              "required": true,
+              "type": "select"
+            },
+            {
+              "alerts": [
+                {
+                  "message": "Containers typically live in private subnets",
+                  "variant": "info"
+                },
+                {
+                  "message": "Please select at least 2 subnets"
+                }
+              ],
+              "label": "Container Subnets",
+              "name": "app_subnets",
+              "optionsFrom": {
+                "visible": [
+                  {
+                    "conditions": ["valueFrom == <<project.metadata.network>>"],
+                    "valueFrom": "vpc_id"
+                  }
+                ],
+                "disabled": [
+                  {
+                    "conditions": [
+                      "<<project.metadata.app_subnets>> not empty",
+                      "valueFrom != <<cloud.resources.subnets[subnet_id is in <<project.metadata.app_subnets>>].assign_public_ip>>"
+                    ],
+                    "valueFrom": "assign_public_ip"
+                  }
+                ],
+                "titleKey": "name",
+                "valueKey": "subnet_id",
+                "values": "<<cloud.resources.subnets>>"
+              },
+              "required": true,
+              "type": "multiselect",
+              "visible": [
+                {
+                  "conditions": ["<<project.metadata.network>> not empty"]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "title": "Container Networking"
+    },
+    {
+      "sections": [
+        {
+          "fields": [
+            {
+              "label": "EC2 Instance ID",
+              "name": "instance_id",
+              "type": "text",
+              "required": true,
+              "alerts": [
+                {
+                  "message": "EC2 Instance running the MySQL Server to be modified"
+                }
+              ]
+            },
+            {
+              "label": "Runtime User",
+              "name": "runtime_user",
+              "type": "text",
+              "required": true,
+              "default": "logn",
+              "alerts": [
+                {
+                  "message": "Remote user used to access the EC2 Instance"
+                }
+              ]
+            },
+            {
+              "label": "Instance Cores",
+              "name": "cores",
+              "type": "number",
+              "required": true,
+              "default": "4",
+              "alerts": [
+                {
+                  "message": "Number of Cores to be used while building the LogN package. This is typically the number of your EC2 instance's CPU Cores"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "title": "Script Configuration"
+    }
+  ]
+}
